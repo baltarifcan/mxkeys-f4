@@ -93,10 +93,16 @@ fi
 
 mkdir -p "$(dirname "$DEST")"
 
-# Compare against the source before replacing: an unchanged binary must keep its
-# existing signature, because re-signing produces a new cdhash and, for anything
-# that keyed on it, a new identity.
-if [ -f "$DEST" ] && cmp -s "$SRC" "$DEST"; then
+# Skip when the installed copy already came from this exact source.
+#
+# Comparing $SRC to $DEST directly does not work -- $DEST carries a signature
+# the source does not, so they never match and every activation would re-sign.
+# Re-signing is not free: it mints a new cdhash, and anything that recorded the
+# old one has to be re-approved. A sidecar recording the source store path is
+# the cheap, correct test, since a store path already encodes its contents.
+stamp="$DEST.source"
+if [ -f "$DEST" ] && [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$SRC" ] \
+   && /usr/bin/codesign --verify "$DEST" 2>/dev/null; then
   exit 0
 fi
 
@@ -105,4 +111,5 @@ install -m 0755 "$SRC" "$tmpbin"
 /usr/bin/codesign --force --sign "$CN" --identifier mxkeys-f4d --timestamp=none "$tmpbin" 2>/dev/null \
   || die "codesign failed"
 mv -f "$tmpbin" "$DEST"
+printf '%s' "$SRC" > "$stamp"
 say "installed signed daemon at $DEST"
