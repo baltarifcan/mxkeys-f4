@@ -1,0 +1,22 @@
+[package]
+name = "mxkeys-f4"
+version = "0.1.0"
+edition = "2024"
+description = "Give the Logitech MX Keys F4 key back on macOS without giving up F12"
+license = "MIT"
+repository = "https://github.com/baltarifcan/mxkeys-f4"
+
+[[bin]]
+name = "mxkeys-f4d"
+path = "src/main.rs"
+
+# No dependencies, deliberately. Everything this needs is CoreFoundation,
+# IOKit and CoreGraphics, which are resident in every macOS process already.
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
