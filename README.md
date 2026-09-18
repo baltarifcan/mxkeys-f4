@@ -105,33 +105,26 @@ to zero. Rewriting it in C or Swift moves the number by under 3%:
 | C | 35 KB | 2619 KB |
 | Swift with Foundation | 84 KB | 2880 KB |
 
-Rust was chosen for being marginally lowest and, more usefully, for building
-reproducibly in Nix against nixpkgs' Apple SDK with no dependency on a system
-Xcode toolchain.
+Rust was chosen for being marginally lowest and, more usefully, for linking
+only public frameworks, so `cargo build` needs nothing beyond the Xcode Command
+Line Tools.
 
 ## Install
 
-Requires macOS and a paired MX Keys.
+Requires macOS, a paired MX Keys, and a Rust toolchain (`mise use -g rust`, or
+rustup).
 
 ```sh
-nix run github:baltarifcan/mxkeys-f4        # try it in the foreground
+git clone https://github.com/baltarifcan/mxkeys-f4
+cd mxkeys-f4
+./install.sh
 ```
 
-As a flake input with Home Manager:
+That builds the daemon, installs a **code-signed** copy at
+`~/.local/libexec/mxkeys-f4d`, binds macOS symbolic hotkey 160 ("Show Apps" on
+macOS 26+, "Show Launchpad" before it) to F18, and loads the LaunchAgents.
 
-```nix
-{
-  inputs.mxkeys-f4.url = "github:baltarifcan/mxkeys-f4";
-
-  # in your home-manager configuration
-  imports = [ inputs.mxkeys-f4.homeManagerModules.default ];
-  programs.mxkeys-f4.enable = true;
-}
-```
-
-That installs a LaunchAgent, binds macOS symbolic hotkey 160 ("Show Apps" on
-macOS 26+, "Show Launchpad" before it) to F18, and installs a **code-signed**
-copy of the daemon at `~/.local/libexec/mxkeys-f4d`.
+`./install.sh --uninstall` removes the agents and the installed daemon.
 
 ### Two permissions, granted once
 
@@ -154,20 +147,22 @@ untrusted identity, the signature is just as stable, and skipping the trust step
 means no `sudo` and no authorisation dialog. Same reasoning, and the same
 approach, as [alt-tab-unlocked](https://github.com/baltarifcan/alt-tab-unlocked).
 
-The binary is copied rather than symlinked into `/nix/store` for the same
-reason: TCC records the path, and store paths change on every rebuild.
+The binary is copied to a fixed path rather than run from the build directory
+for the same reason: TCC records the path, and a build directory is not stable.
 
 ### Options
 
-```nix
-programs.mxkeys-f4 = {
-  enable = true;
-  productId = 45915;      # 0xb35b, the universal MX Keys
-  controlId = 225;        # 0x00e1, the F4 control
-  keyCode = 79;           # F18
-  symbolicHotKey = 160;   # Show Apps; null to bind the key yourself
-};
+The constants at the top of `install.sh`:
+
+```sh
+VENDOR=1133      # 0x046d, Logitech
+PRODUCT=45915    # 0xb35b, the universal MX Keys
+CONTROL=225      # 0x00e1, the F4 control
+KEYCODE=79       # F18
 ```
+
+The daemon takes the same values as flags, so `mxkeys-f4d --help` is the
+reference.
 
 The daemon takes the same settings as flags — `mxkeys-f4d --help`. Nothing about
 it is MX Keys specific beyond the defaults; any Logitech device exposing
