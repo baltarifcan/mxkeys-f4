@@ -176,6 +176,13 @@ it is MX Keys specific beyond the defaults; any Logitech device exposing
   purpose. `0x1B04` can make a divert survive power cycles, but then a stopped
   daemon would leave F4 completely dead instead of merely wrong. Failing soft is
   better. `SIGTERM` clears the divert on the way out.
+- **The handshake retries itself.** On a BLE keyboard the attach callback can
+  beat the radio by several seconds — waking the Mac is the reliable way to see
+  it — and the `0x1B04` probe then times out against a device that plainly has
+  the feature. The daemon backs off 1, 2, 4 … up to 30 seconds until the divert
+  is confirmed, rather than giving up and leaving F4 typing F12 until someone
+  notices. A probe that is *answered* with "no such feature" is not retried:
+  that one is a real answer, and no number of attempts will change it.
 - **It only fixes one key.** Deliberately. This is not a Logitech control panel.
   For that, see [OpenLogi](https://github.com/AprilNEA/OpenLogi) — though note
   it could not enumerate this keyboard when tested: `0xb35b` appears in its
@@ -185,7 +192,7 @@ it is MX Keys specific beyond the defaults; any Logitech device exposing
 
 ## Notes for anyone doing HID++ on macOS
 
-Three things cost real time and are not written down anywhere obvious:
+Four things cost real time and are not written down anywhere obvious:
 
 1. **This keyboard declares only the long report.** Report `0x11` (19-byte
    payload) exists under `0xFF43`; there is no short `0x10` at all. Code that
@@ -196,6 +203,11 @@ Three things cost real time and are not written down anywhere obvious:
    returns `kIOReturnSuccess` and produces no reply at all.
 3. **Input reports arrive with the report id already at byte 0**, so prepending
    the callback's `reportID` gives you a duplicate.
+4. **A silent probe and a negative answer look identical if you let them.**
+   `0x0000` from the root feature table means "I do not have that feature"; no
+   reply at all means the radio is still waking. Collapsing both into `None`
+   reports absent hardware every time a BLE link is slow, which is the single
+   most misleading failure this daemon can produce.
 
 And one Rust-specific trap, documented at the `State` struct: the attach handler
 pumps the run loop while awaiting a reply, which re-enters the input-report

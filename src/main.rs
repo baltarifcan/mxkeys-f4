@@ -62,12 +62,23 @@ type CGEventSourceRef = *const c_void;
 type CGEventRef = *const c_void;
 type IOReturn = c_int;
 type CFIndex = isize;
+type CFRunLoopTimerRef = *const c_void;
+type CFAbsoluteTime = c_double;
+type CFTimeInterval = c_double;
 
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 const K_CF_NUMBER_INT_TYPE: CFIndex = 9;
 const K_IOHID_REPORT_TYPE_OUTPUT: u32 = 1;
 const K_IORETURN_SUCCESS: IOReturn = 0;
-const K_IORETURN_NOT_PERMITTED: IOReturn = -536_870_207; // 0xE00002C1
+/// `kIOReturnNotPermitted`, which is what a refused Input Monitoring grant
+/// actually returns. Measured, not guessed: a copy of this daemon launched from
+/// a shell — where TCC attributes the request to the terminal rather than to the
+/// binary — is refused with exactly this.
+///
+/// The test used to be against `0xE00002C1`, which is `kIOReturnNotPrivileged`,
+/// a different error that an open never returns. So the branch never ran, and
+/// the one message that names the fix printed as a bare hex code instead.
+const K_IORETURN_NOT_PERMITTED: IOReturn = -536_870_174; // 0xE00002E2
 const K_CG_EVENT_FLAG_MASK_SECONDARY_FN: u64 = 0x0080_0000;
 const K_CG_HID_EVENT_TAP: u32 = 0;
 const K_CG_EVENT_SOURCE_STATE_HID: u32 = 1;
@@ -75,6 +86,19 @@ const K_CG_EVENT_SOURCE_STATE_HID: u32 = 1;
 type IOHIDReportCallback =
     extern "C" fn(*mut c_void, IOReturn, *mut c_void, u32, u32, *mut u8, CFIndex);
 type IOHIDDeviceCallback = extern "C" fn(*mut c_void, IOReturn, *mut c_void, IOHIDDeviceRef);
+type CFRunLoopTimerCallBack = extern "C" fn(CFRunLoopTimerRef, *mut c_void);
+
+/// Only `version` and `info` are ever read here: the timer outlives the process
+/// and `info` points at the leaked `State`, so the retain/release hooks that
+/// would manage a shorter-lived context have nothing to do.
+#[repr(C)]
+struct CFRunLoopTimerContext {
+    version: CFIndex,
+    info: *mut c_void,
+    retain: *const c_void,
+    release: *const c_void,
+    copy_description: *const c_void,
+}
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
@@ -94,6 +118,18 @@ unsafe extern "C" {
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     fn CFRunLoopRun();
     fn CFRunLoopRunInMode(mode: CFStringRef, seconds: c_double, return_after_source: u8) -> i32;
+    fn CFAbsoluteTimeGetCurrent() -> CFAbsoluteTime;
+    fn CFRunLoopTimerCreate(
+        a: CFAllocatorRef,
+        fire_date: CFAbsoluteTime,
+        interval: CFTimeInterval,
+        flags: u32,
+        order: CFIndex,
+        callout: CFRunLoopTimerCallBack,
+        context: *mut CFRunLoopTimerContext,
+    ) -> CFRunLoopTimerRef;
+    fn CFRunLoopAddTimer(r: CFRunLoopRef, t: CFRunLoopTimerRef, mode: CFStringRef);
+    fn CFRunLoopTimerSetNextFireDate(t: CFRunLoopTimerRef, fire_date: CFAbsoluteTime);
     fn CFRelease(t: CFTypeRef);
 }
 
@@ -158,6 +194,15 @@ const SOFTWARE_ID: u8 = 1;
 const FEATURE_ROOT: u8 = 0x00;
 const FEATURE_REPROG_CONTROLS_V4: u16 = 0x1B04;
 
+/// Far enough out to mean "never". The retry timer repeats on this interval so
+/// that it stays valid — a one-shot `CFRunLoopTimer` invalidates itself when it
+/// fires — and every actual attempt is scheduled by moving its fire date.
+const RETRY_NEVER: c_double = 1.0e9;
+/// Ceiling on the backoff. A keyboard whose radio is merely slow answers within
+/// a second or two; one that is switched off should not be polled hard for
+/// however many hours it stays that way.
+const RETRY_MAX_DELAY: c_double = 30.0;
+
 /// `IOHIDDeviceSetReport` on this device wants the report id **both** as the
 /// `reportID` argument and as byte 0 of the buffer. Passing it only as the
 /// argument is silently accepted and produces no reply.
@@ -179,6 +224,16 @@ impl Default for Config {
     fn default() -> Self {
         Self { vendor_id: 0x046D, product_id: 0xB35B, cid: 0x00E1, key_code: 79, verbose: false }
     }
+}
+
+/// What the root feature table said about a feature id.
+enum Probe {
+    /// The device answered with the feature's index in its own table.
+    Ready(u8),
+    /// The device answered, and the answer is that it has no such feature.
+    Absent,
+    /// The device did not answer at all. Says nothing about the feature.
+    Silent,
 }
 
 /// Every mutable field is a `Cell`, and every method takes `&self`.
@@ -204,6 +259,17 @@ struct State {
     reply: Cell<[u8; REPORT_LEN]>,
     have_reply: Cell<bool>,
     want_feature: Cell<u8>,
+    /// Whether `IOHIDDeviceOpen` has succeeded for the device currently held.
+    /// Separate from `device` because a bring-up can fail after the ref is
+    /// known but before the open takes, and the retry must not open twice.
+    opened: Cell<bool>,
+    /// Fires when a failed bring-up is due another attempt. Parked at
+    /// `RETRY_NEVER` whenever there is nothing owed, so an idle daemon really
+    /// is idle rather than waking on a poll it almost never needs.
+    retry_timer: Cell<CFRunLoopTimerRef>,
+    /// Attempts made since the last success. Drives the backoff, and keeps the
+    /// log to one line per failure rather than one per attempt.
+    attempt: Cell<u32>,
 }
 
 impl State {
@@ -250,9 +316,17 @@ impl State {
         Some(out)
     }
 
-    fn feature_index(&self, id: u16) -> Option<u8> {
-        let r = self.call(FEATURE_ROOT, 0x00, &[(id >> 8) as u8, (id & 0xFF) as u8, 0])?;
-        (r[0] != 0).then_some(r[0])
+    /// The two failures here are not the same failure, and conflating them is
+    /// what made a sleeping radio look like missing hardware. A reply carrying
+    /// index 0 is the device saying it does not implement the feature, which no
+    /// number of retries will change. *No reply at all* is a timeout, and on a
+    /// BLE keyboard that is the ordinary shape of "not awake yet".
+    fn feature_index(&self, id: u16) -> Probe {
+        match self.call(FEATURE_ROOT, 0x00, &[(id >> 8) as u8, (id & 0xFF) as u8, 0]) {
+            None => Probe::Silent,
+            Some(r) if r[0] == 0 => Probe::Absent,
+            Some(r) => Probe::Ready(r[0]),
+        }
     }
 
     fn set_divert(&self, on: bool) {
@@ -330,34 +404,69 @@ impl State {
         }
     }
 
-    fn on_attach(&self, device: IOHIDDeviceRef, buf: *mut u8) {
+    fn on_attach(&self, device: IOHIDDeviceRef) {
         if !self.device.get().is_null() {
             return;
         }
         self.log("keyboard attached");
         self.device.set(device);
+        self.opened.set(false);
+        self.attempt.set(0);
+        self.try_bring_up();
+    }
 
-        let rc = unsafe { IOHIDDeviceOpen(device, 0) };
-        if rc != K_IORETURN_SUCCESS {
-            self.device.set(ptr::null());
-            if rc == K_IORETURN_NOT_PERMITTED {
-                self.log("cannot open device: grant this binary Input Monitoring");
-            } else {
-                self.log(&format!("cannot open device: IOReturn {rc:#010x}"));
-            }
+    /// One complete attempt at everything the daemon needs from the keyboard:
+    /// open it, locate `0x1B04`, divert the control, and confirm the divert
+    /// took. Every step of that talks to a BLE radio that may still be coming
+    /// up — notably right after the Mac wakes, when the attach callback beats
+    /// the link by several seconds — so each transient failure schedules
+    /// another attempt rather than giving up.
+    ///
+    /// Giving up was the old behaviour, and it left the key typing F12 until a
+    /// human noticed. The external watchdog that was supposed to cover that
+    /// could not: `read -t` returns 1 on timeout in the bash 3.2 that ships as
+    /// `/bin/bash`, which its loop read as "the pipe died" and exited on, five
+    /// seconds after every launch. Recovery belongs here, where the failure is.
+    fn try_bring_up(&self) {
+        let device = self.device.get();
+        if device.is_null() {
             return;
         }
 
-        let ctx = self as *const State as *mut c_void;
-        unsafe {
-            IOHIDDeviceRegisterInputReportCallback(device, buf, 64, report_cb, ctx);
-            IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+        if !self.opened.get() {
+            let rc = unsafe { IOHIDDeviceOpen(device, 0) };
+            if rc != K_IORETURN_SUCCESS {
+                if rc == K_IORETURN_NOT_PERMITTED {
+                    // A missing TCC grant. No number of retries produces one —
+                    // it wants a human in System Settings — and retrying would
+                    // only bury the line that says so. Drop the device with it:
+                    // `on_attach` ignores an attach while one is held, and the
+                    // reconnect after the grant is granted is the only chance
+                    // this process gets to notice.
+                    self.log("cannot open device: grant this binary Input Monitoring");
+                    self.device.set(ptr::null());
+                } else {
+                    // Usually another process still holding the device. Clears.
+                    self.retry(&format!("cannot open device: IOReturn {rc:#010x}"));
+                }
+                return;
+            }
+            let ctx = self as *const State as *mut c_void;
+            unsafe {
+                IOHIDDeviceRegisterInputReportCallback(device, report_buffer(), 64, report_cb, ctx);
+                IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+            }
+            self.opened.set(true);
         }
 
         match self.feature_index(FEATURE_REPROG_CONTROLS_V4) {
-            Some(f) => self.feature.set(f),
-            None => {
+            Probe::Ready(f) => self.feature.set(f),
+            Probe::Absent => {
                 self.log("device does not expose HID++ feature 0x1B04");
+                return;
+            }
+            Probe::Silent => {
+                self.retry("keyboard did not answer the feature probe");
                 return;
             }
         }
@@ -368,12 +477,59 @@ impl State {
         // fact about the device rather than about our intent.
         for _ in 0..40 {
             unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.02, 1) };
+            // Pumping lets the removal callback run. If it did, there is nothing
+            // left to confirm against, and the next attach starts a fresh
+            // bring-up anyway.
+            if self.device.get().is_null() {
+                return;
+            }
             if self.divert_is_set() {
-                self.log("control diverted — the key is live, and F12 is untouched");
+                match self.attempt.get() {
+                    0 => self.log("control diverted — the key is live, and F12 is untouched"),
+                    n => self.log(&format!(
+                        "control diverted after {} more {} — the key is live, and F12 is untouched",
+                        n,
+                        if n == 1 { "attempt" } else { "attempts" },
+                    )),
+                }
+                self.attempt.set(0);
+                self.disarm_retry();
                 return;
             }
         }
-        self.log("divert was not confirmed by the device");
+        self.retry("divert was not confirmed by the device");
+    }
+
+    /// Note a transient failure and schedule another attempt.
+    ///
+    /// Only the first failure of a bring-up is logged. The rest are silent on
+    /// purpose: a keyboard left switched off would otherwise write two lines a
+    /// minute into a log nothing rotates, and the line that matters — the one
+    /// naming why the first attempt failed — would be the hardest to find.
+    fn retry(&self, why: &str) {
+        let n = self.attempt.get();
+        if n == 0 {
+            self.log(&format!("{why}; retrying"));
+        }
+        self.attempt.set(n + 1);
+
+        let delay = (1u32 << n.min(5)) as c_double;
+        let timer = self.retry_timer.get();
+        if !timer.is_null() {
+            unsafe {
+                let at = CFAbsoluteTimeGetCurrent() + delay.min(RETRY_MAX_DELAY);
+                CFRunLoopTimerSetNextFireDate(timer, at);
+            }
+        }
+    }
+
+    fn disarm_retry(&self) {
+        let timer = self.retry_timer.get();
+        if !timer.is_null() {
+            unsafe {
+                CFRunLoopTimerSetNextFireDate(timer, CFAbsoluteTimeGetCurrent() + RETRY_NEVER);
+            }
+        }
     }
 
     fn on_detach(&self) {
@@ -381,6 +537,10 @@ impl State {
         self.device.set(ptr::null());
         self.feature.set(0);
         self.pressed.set(false);
+        self.opened.set(false);
+        // Nothing to retry against: the next attach starts a fresh bring-up.
+        self.attempt.set(0);
+        self.disarm_retry();
     }
 
     /// Hand the key back before exiting. Without this the control stays diverted
@@ -424,7 +584,19 @@ extern "C" fn attach_cb(ctx: *mut c_void, _r: IOReturn, _s: *mut c_void, dev: IO
         return;
     }
     let state = unsafe { &*(ctx as *const State) };
-    state.on_attach(dev, report_buffer());
+    state.on_attach(dev);
+}
+
+extern "C" fn retry_cb(_t: CFRunLoopTimerRef, ctx: *mut c_void) {
+    if ctx.is_null() {
+        return;
+    }
+    let state = unsafe { &*(ctx as *const State) };
+    // Park the timer before the attempt, not after. `try_bring_up` pumps the
+    // run loop while it waits on the keyboard, and a fire date that fell due
+    // during that pumping would re-enter this callback on top of itself.
+    state.disarm_retry();
+    state.try_bring_up();
 }
 
 extern "C" fn detach_cb(ctx: *mut c_void, _r: IOReturn, _s: *mut c_void, _d: IOHIDDeviceRef) {
@@ -510,6 +682,9 @@ fn main() {
         reply: Cell::new([0; REPORT_LEN]),
         have_reply: Cell::new(false),
         want_feature: Cell::new(0),
+        opened: Cell::new(false),
+        retry_timer: Cell::new(ptr::null()),
+        attempt: Cell::new(0),
     }));
     let ctx = state as *const State as *mut c_void;
 
@@ -520,6 +695,29 @@ fn main() {
     }
 
     state.log("starting");
+
+    // Created before the HID manager, so it is already there for the first
+    // attach callback rather than being raced by it.
+    unsafe {
+        let mut tctx = CFRunLoopTimerContext {
+            version: 0,
+            info: ctx,
+            retain: ptr::null(),
+            release: ptr::null(),
+            copy_description: ptr::null(),
+        };
+        let timer = CFRunLoopTimerCreate(
+            kCFAllocatorDefault,
+            CFAbsoluteTimeGetCurrent() + RETRY_NEVER,
+            RETRY_NEVER,
+            0,
+            0,
+            retry_cb,
+            &mut tctx,
+        );
+        state.retry_timer.set(timer);
+        CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
+    }
 
     unsafe {
         let mgr = IOHIDManagerCreate(kCFAllocatorDefault, 0);

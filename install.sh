@@ -28,6 +28,11 @@ DEST="$HOME/.local/libexec/mxkeys-f4d"
 AGENTS="$HOME/Library/LaunchAgents"
 LOG="$HOME/Library/Logs/mxkeys-f4.log"
 LABEL=local.mxkeys-f4
+
+# Retired. The daemon retries its own handshake now, so there is no second agent
+# to install -- but an earlier install may still have one loaded, and that has to
+# be booted out rather than merely left behind: it kickstarts the daemon whenever
+# it sees a failure line, which would cut the daemon's own backoff short.
 WATCHDOG_LABEL=local.mxkeys-f4-watchdog
 WATCHDOG="$HOME/.local/bin/mxkeys-f4-watchdog"
 
@@ -42,7 +47,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   say "Removing mxkeys-f4"
   launchctl bootout "gui/$U/$WATCHDOG_LABEL" 2>/dev/null || true
   launchctl bootout "gui/$U/$LABEL" 2>/dev/null || true
-  rm -f "$AGENTS/$LABEL.plist" "$AGENTS/$WATCHDOG_LABEL.plist" "$DEST" "$DEST.source"
+  rm -f "$AGENTS/$LABEL.plist" "$AGENTS/$WATCHDOG_LABEL.plist" "$DEST" "$DEST.source" "$WATCHDOG"
   note "The signing identity is left in the login keychain. Remove it from"
   note "Keychain Access if you want the TCC grants invalidated too."
   exit 0
@@ -105,13 +110,11 @@ plist() { # plist <label> -- args...
 plist "$LABEL" -- "$DEST" \
   --vendor "$VENDOR" --product "$PRODUCT" --cid "$CONTROL" --key "$KEYCODE"
 
-# The watchdog restarts the daemon when its once-per-attach handshake loses a
-# race with the keyboard's own startup -- which is what closing the lid does.
-# Optional: skipped when the script is not installed.
-if [ -x "$WATCHDOG" ]; then
-  plist "$WATCHDOG_LABEL" -- "$WATCHDOG"
-else
-  note "no $WATCHDOG; skipping the watchdog agent"
+if [ -f "$AGENTS/$WATCHDOG_LABEL.plist" ] || [ -e "$WATCHDOG" ]; then
+  say "Removing the old watchdog agent"
+  launchctl bootout "gui/$U/$WATCHDOG_LABEL" 2>/dev/null || true
+  rm -f "$AGENTS/$WATCHDOG_LABEL.plist" "$WATCHDOG"
+  note "the daemon retries its own handshake now"
 fi
 
 say "Loading"
@@ -128,16 +131,10 @@ wait_gone() {
   return 1
 }
 
-for l in "$WATCHDOG_LABEL" "$LABEL"; do
-  [ -f "$AGENTS/$l.plist" ] || continue
-  launchctl bootout "gui/$U/$l" 2>/dev/null || true
-  wait_gone "gui/$U/$l" || note "warning: $l is still loaded"
-done
-for l in "$LABEL" "$WATCHDOG_LABEL"; do
-  [ -f "$AGENTS/$l.plist" ] || continue
-  launchctl bootstrap "gui/$U" "$AGENTS/$l.plist" || die "could not load $l"
-  note "loaded $l"
-done
+launchctl bootout "gui/$U/$LABEL" 2>/dev/null || true
+wait_gone "gui/$U/$LABEL" || note "warning: $LABEL is still loaded"
+launchctl bootstrap "gui/$U" "$AGENTS/$LABEL.plist" || die "could not load $LABEL"
+note "loaded $LABEL"
 
 sleep 3
 say "Result"
